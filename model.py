@@ -2,7 +2,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn 
 from torch.nn import functional as F
-import math 
+import math
+import time
+import torch.optim.adamw 
 
 #---------------------------------------------------------------------------------
 # We use the same name as hugging face GPT-2 for classes and paramters in order 
@@ -18,7 +20,8 @@ class MLP(nn.Module):
         self.c_fc=nn.Linear(config.n_embd, 4* config.n_embd)
         self.gelu=nn.GELU(approximate="tanh")
         self.c_proj=nn.Linear(4* config.n_embd, config.n_embd)
-
+        self.c_proj.NANOGPT_SCALE_INIT=1
+        
     def forward(self,x):
         x=self.c_fc(x)
         x=self.gelu(x)
@@ -36,6 +39,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn=nn.Linear(config.n_embd,3* config.n_embd)
         # Out put projection
         self.c_proj=nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT=1
         # 
         self.n_head=config.n_head
         self.n_embd=config.n_embd
@@ -61,12 +65,17 @@ class CausalSelfAttention(nn.Module):
         v=v.view(B,S,self.n_head,E//self.n_head ).transpose(1,2)
         # Calculation of the attention score
         # q dot k/ sqrt(d_heads)
-        att= (q @ k.transpose(-2,-1)) * (1/ math.sqrt(k.size(-1)))
-        # replace the upper half of the triangle with - infinity to kill the corresponding softmax
-        att=att.masked_fill(self.bias[:,:,:S,:S]==0,float('-inf'))
-        att=F.softmax(att,dim=-1)
-        
-        y=att @ v
+        #---flash attention implementation
+        # 
+        y=F.scaled_dot_product_attention(q,k,v,is_causal=True)
+        #----------------------------------
+        # att= (q @ k.transpose(-2,-1)) * (1/ math.sqrt(k.size(-1)))
+        # # replace the upper half of the triangle with - infinity to kill the corresponding softmax
+        # att=att.masked_fill(self.bias[:,:,:S,:S]==0,float('-inf'))
+        # att=F.softmax(att,dim=-1)
+        # y=att @ v
+
+
         y=y.transpose(1,2).contiguous().view(B,S,E)
         y=self.c_proj(y)
 
@@ -119,8 +128,24 @@ class GPT(nn.Module):
           ))
         
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight=self.lm_head.weight
 
-    def forward(self, idx):
+    # model initialization, need to some thinking 
+    def _initial_weights(self,module):
+        
+        if isinstance(module,nn.Linear):
+            std=0.02
+            if hasattr(module,"NANOGPT_SCALE_INIT"):
+                std*=(2*self.config.n_layers)** -0.5
+            torch.nn.init.normal_(module.weight,mean=0,std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            torch.nn.init.normal_(module.weight,mean=0,std=std)        
+
+
+
+    def forward(self, idx, target=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
@@ -131,7 +156,11 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss=None
+        if target is not None:
+            loss=F.cross_entropy(logits.view(-1,logits.size(-1)), target.view(-1))
+
+        return logits,loss
     # use classmethod to call the class from within the class
     # so we can initialize the model with the GPT-2 parameters 
     @classmethod
@@ -182,28 +211,85 @@ class GPT(nn.Module):
 
         return model
 #--------------------------------------------------------------------------------
-# auto-detect the availble device 
-device="cpu"
-if torch.cuda.is_available():
-    device="cuda"
-elif hasattr(torch.backends,"mps") and torch.backends.mps.is_available():
-    device="mps"
-    print(f"using device: {device}")
-device="cpu"
-sequence_max=30
-n_sequence=5
+#auto-detect the availble device 
 
-
-model=GPT(GPTConfig())#GPT.from_pretrained('gpt2') 
-model.eval()
-model.to(device)
+device="cpu"
+# if torch.cuda.is_available():
+#     device="cuda"
+# elif hasattr(torch.backends,"mps") and torch.backends.mps.is_available():
+#     device="mps"
+# sequence_max=30
+# n_sequence=5
 
 import tiktoken
-enc=tiktoken.get_encoding("gpt2")
-tokens=enc.encode("Hello, I'm a language model,")
-tokens=torch.tensor(tokens,dtype=torch.long)
-tokens=tokens.unsqueeze(0).repeat(n_sequence,1)
+
+class dataloader:
+    def __init__(self,B,S):
+        self.B=B
+        self.S=S
+         
+        with open('input.txt','r') as f:
+            text_data=f.read() 
+        enc=tiktoken.get_encoding("gpt2")
+        tokens=enc.encode(text_data)
+        self.tokens=torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f" 1 epoch includes {len(self.tokens)// (B* S)} batches ")
+            
+        self.starting_postions=0
+
+    def next_batch(self):
+            B,S= self.B,self.S
+            buf= self.tokens[self.starting_postions:self.starting_postions+B*S+1]
+            x= buf[:-1].view(B,S)
+            y= buf[1:].view(B,S)
+
+            self.starting_postions+=B*S
+            #reset if out of bounds
+            if self.starting_postions+B*S>len(self.tokens)-1:
+                self.starting_position=0
+
+            return x, y    
+
+
+
+
+# text_data=text_data[1:1000]
+# tokens=enc.encode(text_data)
+# B,S=4,32
+# buf=torch.tensor(tokens[:B*S+1],)
+# x=buf[:-1].view(B,S)
+# y=buf[1:].view(B,S)
+
+
+model=GPT(GPTConfig(vocab_size=50304))#GPT.from_pretrained('gpt2') 
+model.to(device)
+#model=torch.compile(model)
+optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4)
+training_set=dataloader(B=4,S=32)
+
+for i in range(10):
+    t0=time.time()
+    x, y=training_set.next_batch()
+    x, y=x.to(device),y.to(device)
+    optimizer.zero_grad()
+    logits,loss=model(x,y)
+    loss.backward()
+    optimizer.step()
+    #torch.cuda.synchronize()
+    t1=time.time()
+    print(f"step:{i}, the loss is {loss.item()}, took:{t1-t0}s")
+
+
+
+
+
+import sys; sys.exit()
+# tokens=enc.encode("Hello, I'm a language model,")
+# tokens=torch.tensor(tokens,dtype=torch.long)
+# tokens=tokens.unsqueeze(0).repeat(n_sequence,1)
 x=tokens.to(device)
+
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
