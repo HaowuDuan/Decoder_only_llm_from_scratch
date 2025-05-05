@@ -265,20 +265,21 @@ class dataloader:
 model=GPT(GPTConfig(vocab_size=50304))#GPT.from_pretrained('gpt2') 
 model.to(device)
 #model=torch.compile(model)
-optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4)
+optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4,betas=(0.9,0.95),eps=1e-8)
 training_set=dataloader(B=4,S=32)
 
-for i in range(10):
+for i in range(50):
     t0=time.time()
     x, y=training_set.next_batch()
     x, y=x.to(device),y.to(device)
     optimizer.zero_grad()
     logits,loss=model(x,y)
     loss.backward()
+    norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
     optimizer.step()
     #torch.cuda.synchronize()
     t1=time.time()
-    print(f"step:{i}, the loss is {loss.item()}, took:{t1-t0}s")
+    print(f"step:{i:4d}|loss: {loss.item()}| norm: {norm:.4f} |dt: {t1-t0}s")
 
 
 
