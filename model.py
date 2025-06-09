@@ -211,19 +211,3 @@ class GPT(nn.Module):
 
         return model
 #--------------------------------------------------------------------------------
-
-
-
-
-for i in range(50):
-    t0=time.time()
-    x, y=training_set.next_batch()
-    x, y=x.to(device),y.to(device)
-    optimizer.zero_grad()
-    logits,loss=model(x,y)
-    loss.backward()
-    norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
-    optimizer.step()
-    #torch.cuda.synchronize()
-    t1=time.time()
-    print(f"step:{i:4d}|loss: {loss.item()}| norm: {norm:.4f} |dt: {t1-t0}s")
